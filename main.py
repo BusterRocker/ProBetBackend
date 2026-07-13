@@ -17,7 +17,7 @@ app.add_middleware(
 )
 
 # --- DB REGISTRY ---
-DB_FILE = "probet.db"
+DB_FILE = "postgresql://neondb_owner:npg_rNAhGz3HVR1u@ep-young-wildflower-aj5vciva-pooler.c-3.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
