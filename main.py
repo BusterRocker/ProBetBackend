@@ -1,10 +1,12 @@
 import os
 import uuid
 import hashlib
-import sqlite3
+import psycopg2
 import requests
 from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
+
+DB_URL = "postgresql://neondb_owner:npg_rNAhGz3HVR1u@ep-young-wildflower-aj5vciva-pooler.c-3.us-east-2.aws.neon.tech/neondb?sslmode=require"
 
 app = FastAPI()
 
@@ -17,19 +19,23 @@ app.add_middleware(
 )
 
 # --- DB REGISTRY ---
-DB_FILE = "postgresql://neondb_owner:npg_rNAhGz3HVR1u@ep-young-wildflower-aj5vciva-pooler.c-3.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    # Connect directly to your cloud Neon database
+    conn = psycopg2.connect(DB_URL)
     cursor = conn.cursor()
+    
+    # 1. Create users table (Notice: SERIAL PRIMARY KEY replaces AUTOINCREMENT)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
             tier TEXT DEFAULT 'free'
         )
     ''')
+    
+    # 2. Create bets table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS bets (
             id TEXT PRIMARY KEY,
@@ -43,7 +49,9 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
     ''')
+    
     conn.commit()
+    cursor.close()
     conn.close()
 
 init_db()
@@ -70,6 +78,7 @@ def generate_deterministic_analytics(game_id: str, home_team: str, away_team: st
         f"Sharps are hammering the line movement on this matchup over the last 3 hours.",
         f"{home_team} has a {55 + ((seed >> 3) % 15)}% historical covering rate as a home favorite."
     ]
+    
     return {
         "splits": {"public": {"away": public_away, "home": public_home}, "money": {"away": money_away, "home": money_home}},
         "model_projections": {"home": projected_home_prob, "away": 1.0 - projected_home_prob},
@@ -85,16 +94,18 @@ def register_user(data: dict = Body(...)):
     if not username or not password:
         raise HTTPException(status_code=400, detail="Username and password cannot be empty.")
         
-    conn = sqlite3.connect(DB_FILE)
+    conn = psycopg2.connect(DB_URL)
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO users (username, password, tier) VALUES (?, ?, 'free')", (username, password))
+        # Postgres uses %s instead of ? for variables, and RETURNING id to get the new row ID
+        cursor.execute("INSERT INTO users (username, password, tier) VALUES (%s, %s, 'free') RETURNING id", (username, password))
+        user_id = cursor.fetchone()[0]
         conn.commit()
-        user_id = cursor.lastrowid
         return {"success": True, "user_id": user_id, "username": username, "tier": "free"}
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         raise HTTPException(status_code=400, detail="This username is already taken. Please choose another one.")
     finally:
+        cursor.close()
         conn.close()
 
 @app.post("/login")
@@ -102,10 +113,11 @@ def login_user(data: dict = Body(...)):
     username = data.get("username", "").strip().lower()
     password = data.get("password", "").strip()
     
-    conn = sqlite3.connect(DB_FILE)
+    conn = psycopg2.connect(DB_URL)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, username, password, tier FROM users WHERE username = ?", (username,))
+    cursor.execute("SELECT id, username, password, tier FROM users WHERE username = %s", (username,))
     user = cursor.fetchone()
+    cursor.close()
     conn.close()
     
     if not user:
@@ -118,10 +130,11 @@ def login_user(data: dict = Body(...)):
 @app.post("/upgrade")
 def upgrade_user_tier(data: dict = Body(...)):
     user_id = data.get("user_id")
-    conn = sqlite3.connect(DB_FILE)
+    conn = psycopg2.connect(DB_URL)
     cursor = conn.cursor()
-    cursor.execute("UPDATE users SET tier = 'premium' WHERE id = ?", (user_id,))
+    cursor.execute("UPDATE users SET tier = 'premium' WHERE id = %s", (user_id,))
     conn.commit()
+    cursor.close()
     conn.close()
     return {"success": True, "tier": "premium"}
 
@@ -130,6 +143,7 @@ def upgrade_user_tier(data: dict = Body(...)):
 def get_clean_bets(tier: str = Query("free")):
     params = {'apiKey': API_KEY, 'regions': 'us', 'markets': 'h2h', 'oddsFormat': 'american', 'bookmakers': 'draftkings,fanduel,betmgm,caesars'}
     raw_data = []
+    
     try:
         response = requests.get(URL, params=params, timeout=4)
         if response.status_code == 200:
@@ -176,7 +190,7 @@ def get_clean_bets(tier: str = Query("free")):
                             best_home_price, best_home_book = price, b_key
                         elif name == away_team and price > best_away_price:
                             best_away_price, best_away_book = price, b_key
-
+                            
         if best_home_price == -9999: best_home_price = dk_home
         if best_away_price == -9999: best_away_price = dk_away
         analytics = generate_deterministic_analytics(game_id, home_team, away_team)
@@ -184,10 +198,10 @@ def get_clean_bets(tier: str = Query("free")):
         home_edge, away_edge = 0.0, 0.0
         if isinstance(best_home_price, int): home_edge = round((analytics["model_projections"]["home"] - american_to_implied(best_home_price)) * 100, 1)
         if isinstance(best_away_price, int): away_edge = round((analytics["model_projections"]["away"] - american_to_implied(best_away_price)) * 100, 1)
-
+        
         best_pick = home_team if (home_edge > away_edge and home_edge > 2.0) else (away_team if (away_edge > home_edge and away_edge > 2.0) else "N/A")
         calculated_edge_val = home_edge if best_pick == home_team else (away_edge if best_pick == away_team else 0.0)
-
+        
         clean_games_list.append({
             "matchup": f"{away_team} @ {home_team}",
             "baseline_odds": {"home": dk_home, "away": dk_away},
@@ -199,44 +213,52 @@ def get_clean_bets(tier: str = Query("free")):
 
 @app.get("/bets/{user_id}")
 def get_user_bets(user_id: int):
-    conn = sqlite3.connect(DB_FILE)
+    conn = psycopg2.connect(DB_URL)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, matchup, pick, odds, risk, status, net_profit FROM bets WHERE user_id = ? ORDER BY id DESC", (user_id,))
+    cursor.execute("SELECT id, matchup, pick, odds, risk, status, net_profit FROM bets WHERE user_id = %s ORDER BY id DESC", (user_id,))
     rows = cursor.fetchall()
+    cursor.close()
     conn.close()
+    
     return [{"id": r[0], "matchup": r[1], "pick": r[2], "odds": r[3], "risk": r[4], "status": r[5], "netProfit": r[6]} for r in rows]
 
 @app.post("/bets/log")
 def log_user_bet(data: dict = Body(...)):
     user_id, matchup, pick, odds = data.get("user_id"), data.get("matchup"), data.get("pick"), data.get("odds")
     bet_id = str(uuid.uuid4())[:8]
-    conn = sqlite3.connect(DB_FILE)
+    
+    conn = psycopg2.connect(DB_URL)
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO bets (id, user_id, matchup, pick, odds, risk, status, net_profit) VALUES (?, ?, ?, ?, ?, 100, 'Pending', 0)", (bet_id, user_id, matchup, pick, odds))
+    cursor.execute("INSERT INTO bets (id, user_id, matchup, pick, odds, risk, status, net_profit) VALUES (%s, %s, %s, %s, %s, 100, 'Pending', 0)", (bet_id, user_id, matchup, pick, odds))
     conn.commit()
+    cursor.close()
     conn.close()
     return {"success": True}
 
 @app.post("/bets/settle")
 def settle_user_bet(data: dict = Body(...)):
     bet_id, status, net_profit = data.get("bet_id"), data.get("status"), data.get("net_profit")
-    conn = sqlite3.connect(DB_FILE)
+    
+    conn = psycopg2.connect(DB_URL)
     cursor = conn.cursor()
-    cursor.execute("UPDATE bets SET status = ?, net_profit = ? WHERE id = ?", (status, net_profit, bet_id))
+    cursor.execute("UPDATE bets SET status = %s, net_profit = %s WHERE id = %s", (status, net_profit, bet_id))
     conn.commit()
+    cursor.close()
     conn.close()
     return {"success": True}
 
 # --- NEW DELETE WAGER ENDPOINT ---
 @app.delete("/bets/{bet_id}")
 def delete_user_bet(bet_id: str):
-    conn = sqlite3.connect(DB_FILE)
+    conn = psycopg2.connect(DB_URL)
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM bets WHERE id = ?", (bet_id,))
+    cursor.execute("DELETE FROM bets WHERE id = %s", (bet_id,))
     conn.commit()
     deleted_count = cursor.rowcount
+    cursor.close()
     conn.close()
     
     if deleted_count == 0:
         raise HTTPException(status_code=404, detail="Wager not found.")
+        
     return {"success": True}
