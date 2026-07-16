@@ -3,8 +3,13 @@ import uuid
 import hashlib
 import psycopg2
 import requests
-from fastapi import FastAPI, HTTPException, Query, Body
+import stripe
+from fastapi import FastAPI, HTTPException, Query, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
+
+# Pull keys securely from Render's environment
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
 DB_URL = "postgresql://neondb_owner:npg_rNAhGz3HVR1u@ep-young-wildflower-aj5vciva-pooler.c-3.us-east-2.aws.neon.tech/neondb?sslmode=require"
 
@@ -25,7 +30,7 @@ def init_db():
     conn = psycopg2.connect(DB_URL)
     cursor = conn.cursor()
     
-    # 1. Create users table (Notice: SERIAL PRIMARY KEY replaces AUTOINCREMENT)
+    # 1. Create users table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
@@ -85,6 +90,36 @@ def generate_deterministic_analytics(game_id: str, home_team: str, away_team: st
         "trend_context": trends[seed % len(trends)]
     }
 
+# --- STRIPE WEBHOOK ---
+@app.post("/webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        
+        # Pull the user's ID from the payment link reference
+        user_id = session.get("client_reference_id")
+        
+        if user_id:
+            # Connect to Neon and upgrade user tier
+            conn = psycopg2.connect(DB_URL)
+            cursor = conn.cursor()
+            cursor.execute("UPDATE users SET tier = 'premium' WHERE id = %s", (user_id,))
+            conn.commit()
+            cursor.close()
+            conn.close()
+
+    return {"status": "success"}
+
 # --- AUTHENTICATION INTERCEPTS ---
 @app.post("/register")
 def register_user(data: dict = Body(...)):
@@ -97,7 +132,6 @@ def register_user(data: dict = Body(...)):
     conn = psycopg2.connect(DB_URL)
     cursor = conn.cursor()
     try:
-        # Postgres uses %s instead of ? for variables, and RETURNING id to get the new row ID
         cursor.execute("INSERT INTO users (username, password, tier) VALUES (%s, %s, 'free') RETURNING id", (username, password))
         user_id = cursor.fetchone()[0]
         conn.commit()
