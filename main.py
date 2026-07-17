@@ -90,6 +90,42 @@ def generate_deterministic_analytics(game_id: str, home_team: str, away_team: st
         "trend_context": trends[seed % len(trends)]
     }
 
+# --- STRIPE CHECKOUT ---
+@app.post("/create-checkout-session")
+def create_checkout_session(data: dict = Body(...)):
+    user_id = data.get("user_id")
+    
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Missing user_id")
+        
+    try:
+        # Create the Stripe payment session
+        session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            line_items=[{
+                'price_data': {
+                    'currency': 'usd',
+                    'product_data': {
+                        'name': 'ProBet Premium Access',
+                        'description': 'Weekly subscription for professional analytics',
+                    },
+                    'unit_amount': 500, # $5.00 in cents
+                    'recurring': {
+                        'interval': 'week',
+                    },
+                },
+                'quantity': 1,
+            }],
+            mode='subscription',
+            client_reference_id=str(user_id), # This is crucial: it tells the webhook who paid!
+            success_url='https://pro-bet-mobile.vercel.app/?success=true',
+            cancel_url='https://pro-bet-mobile.vercel.app/?canceled=true',
+        )
+        # Send the secure checkout URL back to the mobile app
+        return {"url": session.url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # --- STRIPE WEBHOOK ---
 @app.post("/webhook")
 async def stripe_webhook(request: Request):
