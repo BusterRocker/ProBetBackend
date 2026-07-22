@@ -118,6 +118,11 @@ def create_checkout_session(data: dict = Body(...)):
             }],
             mode='subscription',
             client_reference_id=str(user_id), # This is crucial: it tells the webhook who paid!
+            subscription_data={
+                "metadata": {
+                    "user_id": str(user_id)
+                }
+            },
             success_url='https://pro-bet-mobile.vercel.app/?success=true',
             cancel_url='https://pro-bet-mobile.vercel.app/?canceled=true',
         )
@@ -150,6 +155,21 @@ async def stripe_webhook(request: Request):
             conn = psycopg2.connect(DB_URL)
             cursor = conn.cursor()
             cursor.execute("UPDATE users SET tier = 'premium' WHERE id = %s", (user_id,))
+            conn.commit()
+            cursor.close()
+            conn.close()
+    
+    if event["type"] == "customer.subscription.deleted":
+        subscription = event["data"]["object"]
+        
+        # Pull the user_id out of the metadata we attached during checkout
+        user_id = subscription.get("metadata", {}).get("user_id")
+        
+        if user_id:
+            conn = psycopg2.connect(DB_URL)
+            cursor = conn.cursor()
+            # Downgrade the user back to free
+            cursor.execute("UPDATE users SET tier = 'free' WHERE id = %s", (user_id,))
             conn.commit()
             cursor.close()
             conn.close()
