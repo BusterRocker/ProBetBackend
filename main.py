@@ -319,6 +319,7 @@ def get_clean_bets(tier: str = Query("free"), sport: str = Query("MLB")):
         # 4. Construct the final dictionary
         game_dict = {
             "matchup": f"{away_team} @ {home_team}",
+            "date": game.get("commence_time", "TBA"),
             "baseline_odds": {"home": dk_home, "away": dk_away},
             "line_shopping": {
                 "home": {"price": best_home_price, "bookmaker": best_home_book}, 
