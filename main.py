@@ -229,8 +229,20 @@ def upgrade_user_tier(data: dict = Body(...)):
     return {"success": True, "tier": "premium"}
 
 # --- LIVE SLATE DATA PROCESSOR ---
+from fastapi import Query
+import requests
+
 @app.get("/")
-def get_clean_bets(tier: str = Query("free")):
+def get_clean_bets(tier: str = Query("free"), sport: str = Query("MLB")):
+    # 1. Map frontend sport selection to The Odds API sport keys
+    sport_keys = {
+        "MLB": "baseball_mlb",
+        "NFL": "americanfootball_nfl",
+        "MLS": "soccer_usa_mls"
+    }
+    api_sport = sport_keys.get(sport.upper(), "baseball_mlb")
+    URL = f"https://api.the-odds-api.com/v4/sports/{api_sport}/odds"
+    
     params = {'apiKey': API_KEY, 'regions': 'us', 'markets': 'h2h', 'oddsFormat': 'american', 'bookmakers': 'draftkings,fanduel,betmgm,caesars'}
     raw_data = []
     
@@ -241,30 +253,26 @@ def get_clean_bets(tier: str = Query("free")):
     except Exception:
         pass
         
+    # 2. Dynamic fallback mock data if the API fails or is out of requests
     if not raw_data or not isinstance(raw_data, list) or "detail" in str(raw_data):
-        raw_data = [
-            {
-                "id": "mock_game_1", "home_team": "Boston Red Sox", "away_team": "New York Yankees",
-                "bookmakers": [{"key": "draftkings", "markets": [{"key": "h2h", "outcomes": [{"name": "Boston Red Sox", "price": -120}, {"name": "New York Yankees", "price": +100}]}]}]
-            },
-            {
-                "id": "mock_game_2", "home_team": "Los Angeles Dodgers", "away_team": "San Francisco Giants",
-                "bookmakers": [{"key": "draftkings", "markets": [{"key": "h2h", "outcomes": [{"name": "Los Angeles Dodgers", "price": -150}, {"name": "San Francisco Giants", "price": +130}]}]}]
-            },
-            {
-                "id": "mock_game_3", "home_team": "Chicago Cubs", "away_team": "St. Louis Cardinals",
-                "bookmakers": [{"key": "draftkings", "markets": [{"key": "h2h", "outcomes": [{"name": "Chicago Cubs", "price": +110}, {"name": "St. Louis Cardinals", "price": -130}]}]}]
-            }
-        ]
+        if sport.upper() == "NFL":
+            raw_data = [{"id": "mock_nfl_1", "home_team": "Kansas City Chiefs", "away_team": "Baltimore Ravens", "bookmakers": [{"key": "draftkings", "markets": [{"key": "h2h", "outcomes": [{"name": "Kansas City Chiefs", "price": -150}, {"name": "Baltimore Ravens", "price": +130}]}]}]}]
+        elif sport.upper() == "MLS":
+            raw_data = [{"id": "mock_mls_1", "home_team": "LA Galaxy", "away_team": "Inter Miami", "bookmakers": [{"key": "draftkings", "markets": [{"key": "h2h", "outcomes": [{"name": "LA Galaxy", "price": +150}, {"name": "Inter Miami", "price": +140}, {"name": "Draw", "price": +210}]}]}]}]
+        else:
+            raw_data = [{"id": "mock_mlb_1", "home_team": "Boston Red Sox", "away_team": "New York Yankees", "bookmakers": [{"key": "draftkings", "markets": [{"key": "h2h", "outcomes": [{"name": "Boston Red Sox", "price": -120}, {"name": "New York Yankees", "price": +100}]}]}]}]
         
     clean_games_list = []
     for game in raw_data:
         game_id = game.get('id', 'unknown')
         home_team = game.get('home_team')
         away_team = game.get('away_team')
-        dk_home, dk_away = "N/A", "N/A"
+        
+        # Initialize variables, adding Draw for MLS
+        dk_home, dk_away, dk_draw = "N/A", "N/A", "N/A"
         best_home_price, best_home_book = -9999, "N/A"
         best_away_price, best_away_book = -9999, "N/A"
+        best_draw_price, best_draw_book = -9999, "N/A"
         
         for bookmaker in game.get('bookmakers', []):
             b_key = bookmaker.get('key', '').upper()
@@ -273,16 +281,23 @@ def get_clean_bets(tier: str = Query("free")):
                     for outcome in market.get('outcomes', []):
                         price = outcome.get('price')
                         name = outcome.get('name')
+                        
                         if bookmaker.get('key') == 'draftkings':
                             if name == home_team: dk_home = price
                             elif name == away_team: dk_away = price
+                            elif name == 'Draw': dk_draw = price
+                            
                         if name == home_team and price > best_home_price:
                             best_home_price, best_home_book = price, b_key
                         elif name == away_team and price > best_away_price:
                             best_away_price, best_away_book = price, b_key
+                        elif name == 'Draw' and price > best_draw_price:
+                            best_draw_price, best_draw_book = price, b_key
                             
         if best_home_price == -9999: best_home_price = dk_home
         if best_away_price == -9999: best_away_price = dk_away
+        if best_draw_price == -9999: best_draw_price = dk_draw
+        
         analytics = generate_deterministic_analytics(game_id, home_team, away_team)
         
         home_edge, away_edge = 0.0, 0.0
@@ -292,14 +307,43 @@ def get_clean_bets(tier: str = Query("free")):
         best_pick = home_team if (home_edge > away_edge and home_edge > 2.0) else (away_team if (away_edge > home_edge and away_edge > 2.0) else "N/A")
         calculated_edge_val = home_edge if best_pick == home_team else (away_edge if best_pick == away_team else 0.0)
         
-        clean_games_list.append({
+        # 3. Generate dynamic player props based on the selected sport
+        player_props = {}
+        if sport.upper() == "NFL":
+            player_props = {"title": "Player Passing Yards", "bets": [f"{away_team} QB Over 245.5 (-110)", f"{home_team} QB Over 260.5 (-110)"]}
+        elif sport.upper() == "MLS":
+            player_props = {"title": "Shots on Target", "bets": [f"{away_team} Striker Over 1.5 (-130)", f"{home_team} Striker Over 0.5 (+110)"]}
+        else:
+            player_props = {"title": "Player Home Runs", "bets": [f"{away_team} Slugger Over 0.5 (+250)", f"{home_team} Slugger Over 0.5 (+310)"]}
+
+        # 4. Construct the final dictionary
+        game_dict = {
             "matchup": f"{away_team} @ {home_team}",
             "baseline_odds": {"home": dk_home, "away": dk_away},
-            "line_shopping": {"home": {"price": best_home_price, "bookmaker": best_home_book}, "away": {"price": best_away_price, "bookmaker": best_away_book}},
-            "premium_analytics": {"edge": {"recommended_pick": best_pick, "edge_percentage": calculated_edge_val}, "splits": analytics["splits"], "trend": analytics["trend_context"]}
-        })
+            "line_shopping": {
+                "home": {"price": best_home_price, "bookmaker": best_home_book}, 
+                "away": {"price": best_away_price, "bookmaker": best_away_book}
+            },
+            "player_props": player_props,
+            "premium_analytics": {
+                "edge": {"recommended_pick": best_pick, "edge_percentage": calculated_edge_val}, 
+                "splits": analytics["splits"], 
+                "trend": analytics["trend_context"]
+            }
+        }
+
+        # 5. Add draw odds if it's MLS
+        if sport.upper() == "MLS" and dk_draw != "N/A":
+            game_dict["baseline_odds"]["draw"] = dk_draw
+            game_dict["line_shopping"]["draw"] = {"price": best_draw_price, "bookmaker": best_draw_book}
+
+        # 6. Mask premium data if user is on the free tier
+        if tier == "free":
+            game_dict["premium_analytics"] = None
+
+        clean_games_list.append(game_dict)
         
-    return {"data": clean_games_list[:1] if tier == "free" else clean_games_list}
+    return {"data": clean_games_list}
 
 @app.get("/bets/{user_id}")
 def get_user_bets(user_id: int):
