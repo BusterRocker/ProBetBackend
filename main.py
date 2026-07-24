@@ -46,6 +46,7 @@ def init_db():
             id TEXT PRIMARY KEY,
             user_id INTEGER NOT NULL,
             matchup TEXT NOT NULL,
+            date TEXT, -- 👈 NEW COLUMN ADDED HERE
             pick TEXT NOT NULL,
             odds INTEGER NOT NULL,
             risk INTEGER NOT NULL,
@@ -54,6 +55,13 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
     ''')
+
+    # 3. Patch the existing live table
+    # This forces Neon to add the column if the table was already created in the past
+    try:
+        cursor.execute("ALTER TABLE bets ADD COLUMN IF NOT EXISTS date TEXT;")
+    except Exception:
+        pass # Silently ignore if it complains
     
     conn.commit()
     cursor.close()
@@ -350,21 +358,29 @@ def get_clean_bets(tier: str = Query("free"), sport: str = Query("MLB")):
 def get_user_bets(user_id: int):
     conn = psycopg2.connect(DB_URL)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, matchup, pick, odds, risk, status, net_profit FROM bets WHERE user_id = %s ORDER BY id DESC", (user_id,))
+    # 👈 Add 'date' to the SELECT statement
+    cursor.execute("SELECT id, matchup, date, pick, odds, risk, status, net_profit FROM bets WHERE user_id = %s ORDER BY id DESC", (user_id,))
     rows = cursor.fetchall()
     cursor.close()
     conn.close()
     
-    return [{"id": r[0], "matchup": r[1], "pick": r[2], "odds": r[3], "risk": r[4], "status": r[5], "netProfit": r[6]} for r in rows]
+    # 👈 Map the new date column (r[2]) to the output dictionary
+    return [{"id": r[0], "matchup": r[1], "date": r[2], "pick": r[3], "odds": r[4], "risk": r[5], "status": r[6], "netProfit": r[7]} for r in rows]
 
 @app.post("/bets/log")
 def log_user_bet(data: dict = Body(...)):
-    user_id, matchup, pick, odds = data.get("user_id"), data.get("matchup"), data.get("pick"), data.get("odds")
+    user_id = data.get("user_id")
+    matchup = data.get("matchup")
+    date = data.get("date", "TBA") # 👈 Catch the date from the frontend
+    pick = data.get("pick")
+    odds = data.get("odds")
     bet_id = str(uuid.uuid4())[:8]
     
     conn = psycopg2.connect(DB_URL)
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO bets (id, user_id, matchup, pick, odds, risk, status, net_profit) VALUES (%s, %s, %s, %s, %s, 100, 'Pending', 0)", (bet_id, user_id, matchup, pick, odds))
+    # 👈 Add 'date' to the INSERT statement below:
+    cursor.execute("INSERT INTO bets (id, user_id, matchup, date, pick, odds, risk, status, net_profit) VALUES (%s, %s, %s, %s, %s, %s, 100, 'Pending', 0)", 
+                   (bet_id, user_id, matchup, date, pick, odds))
     conn.commit()
     cursor.close()
     conn.close()
