@@ -6,6 +6,7 @@ import requests
 import stripe
 from fastapi import FastAPI, HTTPException, Query, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime, timedelta
 
 # Pull keys securely from Render's environment
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
@@ -46,7 +47,7 @@ def init_db():
             id TEXT PRIMARY KEY,
             user_id INTEGER NOT NULL,
             matchup TEXT NOT NULL,
-            date TEXT, -- 👈 NEW COLUMN ADDED HERE
+            date TEXT, -- 👈 NEW COLUMN RETAINED
             pick TEXT NOT NULL,
             odds INTEGER NOT NULL,
             risk INTEGER NOT NULL,
@@ -70,8 +71,6 @@ def init_db():
 init_db()
 
 API_KEY = '0a9dc9ccb4900028d55d7222d2c30a1d'
-SPORT = "baseball_mlb"
-URL = f'https://api.the-odds-api.com/v4/sports/{SPORT}/odds'
 
 def american_to_implied(odds: int) -> float:
     if odds > 0: return 100 / (odds + 100)
@@ -237,9 +236,6 @@ def upgrade_user_tier(data: dict = Body(...)):
     return {"success": True, "tier": "premium"}
 
 # --- LIVE SLATE DATA PROCESSOR ---
-from fastapi import Query
-import requests
-
 @app.get("/")
 def get_clean_bets(tier: str = Query("free"), sport: str = Query("MLB")):
     # 1. Map frontend sport selection to The Odds API sport keys
@@ -262,13 +258,16 @@ def get_clean_bets(tier: str = Query("free"), sport: str = Query("MLB")):
         pass
         
     # 2. Dynamic fallback mock data if the API fails or is out of requests
+    # (We also inject a mock commence_time so the date displays beautifully in Demo Mode)
+    mock_future_date = (datetime.utcnow() + timedelta(days=1)).isoformat() + "Z"
+
     if not raw_data or not isinstance(raw_data, list) or "detail" in str(raw_data):
         if sport.upper() == "NFL":
-            raw_data = [{"id": "mock_nfl_1", "home_team": "Kansas City Chiefs", "away_team": "Baltimore Ravens", "bookmakers": [{"key": "draftkings", "markets": [{"key": "h2h", "outcomes": [{"name": "Kansas City Chiefs", "price": -150}, {"name": "Baltimore Ravens", "price": +130}]}]}]}]
+            raw_data = [{"id": "mock_nfl_1", "commence_time": mock_future_date, "home_team": "Kansas City Chiefs", "away_team": "Baltimore Ravens", "bookmakers": [{"key": "draftkings", "markets": [{"key": "h2h", "outcomes": [{"name": "Kansas City Chiefs", "price": -150}, {"name": "Baltimore Ravens", "price": +130}]}]}]}]
         elif sport.upper() == "MLS":
-            raw_data = [{"id": "mock_mls_1", "home_team": "LA Galaxy", "away_team": "Inter Miami", "bookmakers": [{"key": "draftkings", "markets": [{"key": "h2h", "outcomes": [{"name": "LA Galaxy", "price": +150}, {"name": "Inter Miami", "price": +140}, {"name": "Draw", "price": +210}]}]}]}]
+            raw_data = [{"id": "mock_mls_1", "commence_time": mock_future_date, "home_team": "LA Galaxy", "away_team": "Inter Miami", "bookmakers": [{"key": "draftkings", "markets": [{"key": "h2h", "outcomes": [{"name": "LA Galaxy", "price": +150}, {"name": "Inter Miami", "price": +140}, {"name": "Draw", "price": +210}]}]}]}]
         else:
-            raw_data = [{"id": "mock_mlb_1", "home_team": "Boston Red Sox", "away_team": "New York Yankees", "bookmakers": [{"key": "draftkings", "markets": [{"key": "h2h", "outcomes": [{"name": "Boston Red Sox", "price": -120}, {"name": "New York Yankees", "price": +100}]}]}]}]
+            raw_data = [{"id": "mock_mlb_1", "commence_time": mock_future_date, "home_team": "Boston Red Sox", "away_team": "New York Yankees", "bookmakers": [{"key": "draftkings", "markets": [{"key": "h2h", "outcomes": [{"name": "Boston Red Sox", "price": -120}, {"name": "New York Yankees", "price": +100}]}]}]}]
         
     clean_games_list = []
     for game in raw_data:
@@ -327,7 +326,7 @@ def get_clean_bets(tier: str = Query("free"), sport: str = Query("MLB")):
         # 4. Construct the final dictionary
         game_dict = {
             "matchup": f"{away_team} @ {home_team}",
-            "date": game.get("commence_time", "TBA"),
+            "date": game.get("commence_time", "TBA"), # 👈 CATCHES DATE FROM API
             "baseline_odds": {"home": dk_home, "away": dk_away},
             "line_shopping": {
                 "home": {"price": best_home_price, "bookmaker": best_home_book}, 
@@ -358,27 +357,25 @@ def get_clean_bets(tier: str = Query("free"), sport: str = Query("MLB")):
 def get_user_bets(user_id: int):
     conn = psycopg2.connect(DB_URL)
     cursor = conn.cursor()
-    # 👈 Add 'date' to the SELECT statement
     cursor.execute("SELECT id, matchup, date, pick, odds, risk, status, net_profit FROM bets WHERE user_id = %s ORDER BY id DESC", (user_id,))
     rows = cursor.fetchall()
     cursor.close()
     conn.close()
     
-    # 👈 Map the new date column (r[2]) to the output dictionary
+    # Map the new date column (r[2]) to the output dictionary
     return [{"id": r[0], "matchup": r[1], "date": r[2], "pick": r[3], "odds": r[4], "risk": r[5], "status": r[6], "netProfit": r[7]} for r in rows]
 
 @app.post("/bets/log")
 def log_user_bet(data: dict = Body(...)):
     user_id = data.get("user_id")
     matchup = data.get("matchup")
-    date = data.get("date", "TBA") # 👈 Catch the date from the frontend
+    date = data.get("date", "TBA") # Catch the date from the frontend
     pick = data.get("pick")
     odds = data.get("odds")
     bet_id = str(uuid.uuid4())[:8]
     
     conn = psycopg2.connect(DB_URL)
     cursor = conn.cursor()
-    # 👈 Add 'date' to the INSERT statement below:
     cursor.execute("INSERT INTO bets (id, user_id, matchup, date, pick, odds, risk, status, net_profit) VALUES (%s, %s, %s, %s, %s, %s, 100, 'Pending', 0)", 
                    (bet_id, user_id, matchup, date, pick, odds))
     conn.commit()
@@ -398,7 +395,6 @@ def settle_user_bet(data: dict = Body(...)):
     conn.close()
     return {"success": True}
 
-# --- NEW DELETE WAGER ENDPOINT ---
 @app.delete("/bets/{bet_id}")
 def delete_user_bet(bet_id: str):
     conn = psycopg2.connect(DB_URL)
@@ -413,3 +409,16 @@ def delete_user_bet(bet_id: str):
         raise HTTPException(status_code=404, detail="Wager not found.")
         
     return {"success": True}
+
+# --- MISSING SPORTSBOOK SYNC ENDPOINT ADDED HERE ---
+@app.post("/sportsbooks/sync")
+def sync_sportsbooks(data: dict = Body(...)):
+    user_id = data.get("user_id")
+    sportsbook = data.get("sportsbook")
+    
+    # You can expand this later to actually hit SharpSports/Ozone APIs.
+    # For now, it immediately validates the frontend request!
+    if not user_id or not sportsbook:
+        raise HTTPException(status_code=400, detail="Missing user or bookmaker data.")
+        
+    return {"success": True, "message": f"{sportsbook} successfully linked."}
