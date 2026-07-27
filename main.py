@@ -4,9 +4,10 @@ import hashlib
 import psycopg2
 import requests
 import stripe
+import time
+from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Query, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime, timedelta
 
 # Pull keys securely from Render's environment
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
@@ -27,7 +28,6 @@ app.add_middleware(
 # --- DB REGISTRY ---
 
 def init_db():
-    # Connect directly to your cloud Neon database
     conn = psycopg2.connect(DB_URL)
     cursor = conn.cursor()
     
@@ -47,7 +47,7 @@ def init_db():
             id TEXT PRIMARY KEY,
             user_id INTEGER NOT NULL,
             matchup TEXT NOT NULL,
-            date TEXT, -- 👈 NEW COLUMN RETAINED
+            date TEXT,
             pick TEXT NOT NULL,
             odds INTEGER NOT NULL,
             risk INTEGER NOT NULL,
@@ -58,11 +58,10 @@ def init_db():
     ''')
 
     # 3. Patch the existing live table
-    # This forces Neon to add the column if the table was already created in the past
     try:
         cursor.execute("ALTER TABLE bets ADD COLUMN IF NOT EXISTS date TEXT;")
     except Exception:
-        pass # Silently ignore if it complains
+        pass
     
     conn.commit()
     cursor.close()
@@ -70,7 +69,16 @@ def init_db():
 
 init_db()
 
-API_KEY = '0a9dc9ccb4900028d55d7222d2c30a1d'
+# --- ODDS API & CACHE CONFIGURATION ---
+API_KEY = '1954c37a0303d89d6f84accf5a8c6861'
+
+# Server-side cache dictionary to protect API request limits
+API_CACHE = {
+    "MLB": {"data": None, "last_updated": 0},
+    "NFL": {"data": None, "last_updated": 0},
+    "MLS": {"data": None, "last_updated": 0}
+}
+CACHE_EXPIRATION_SECONDS = 21600  # 6 Hours (60 * 60 * 6)
 
 def american_to_implied(odds: int) -> float:
     if odds > 0: return 100 / (odds + 100)
@@ -106,7 +114,6 @@ def create_checkout_session(data: dict = Body(...)):
         raise HTTPException(status_code=400, detail="Missing user_id")
         
     try:
-        # Create the Stripe payment session
         session = stripe.checkout.Session.create(
             payment_method_types=['card'],
             line_items=[{
@@ -116,7 +123,7 @@ def create_checkout_session(data: dict = Body(...)):
                         'name': 'ProBet Premium Access',
                         'description': 'Weekly subscription for professional analytics',
                     },
-                    'unit_amount': 500, # $5.00 in cents
+                    'unit_amount': 500,
                     'recurring': {
                         'interval': 'week',
                     },
@@ -124,7 +131,7 @@ def create_checkout_session(data: dict = Body(...)):
                 'quantity': 1,
             }],
             mode='subscription',
-            client_reference_id=str(user_id), # This is crucial: it tells the webhook who paid!
+            client_reference_id=str(user_id),
             subscription_data={
                 "metadata": {
                     "user_id": str(user_id)
@@ -133,7 +140,6 @@ def create_checkout_session(data: dict = Body(...)):
             success_url='https://pro-bet-mobile.vercel.app/?success=true',
             cancel_url='https://pro-bet-mobile.vercel.app/?canceled=true',
         )
-        # Send the secure checkout URL back to the mobile app
         return {"url": session.url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -153,12 +159,9 @@ async def stripe_webhook(request: Request):
 
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
-        
-        # Pull the user's ID from the payment link reference
         user_id = session.get("client_reference_id")
         
         if user_id:
-            # Connect to Neon and upgrade user tier
             conn = psycopg2.connect(DB_URL)
             cursor = conn.cursor()
             cursor.execute("UPDATE users SET tier = 'premium' WHERE id = %s", (user_id,))
@@ -168,14 +171,11 @@ async def stripe_webhook(request: Request):
     
     if event["type"] == "customer.subscription.deleted":
         subscription = event["data"]["object"]
-        
-        # Pull the user_id out of the metadata we attached during checkout
         user_id = subscription.get("metadata", {}).get("user_id")
         
         if user_id:
             conn = psycopg2.connect(DB_URL)
             cursor = conn.cursor()
-            # Downgrade the user back to free
             cursor.execute("UPDATE users SET tier = 'free' WHERE id = %s", (user_id,))
             conn.commit()
             cursor.close()
@@ -235,36 +235,45 @@ def upgrade_user_tier(data: dict = Body(...)):
     conn.close()
     return {"success": True, "tier": "premium"}
 
-# --- LIVE SLATE DATA PROCESSOR ---
+# --- LIVE SLATE DATA PROCESSOR (WITH CACHING) ---
 @app.get("/")
 def get_clean_bets(tier: str = Query("free"), sport: str = Query("MLB")):
-    # 1. Map frontend sport selection to The Odds API sport keys
-    sport_keys = {
-        "MLB": "baseball_mlb",
-        "NFL": "americanfootball_nfl",
-        "MLS": "soccer_usa_mls"
-    }
-    api_sport = sport_keys.get(sport.upper(), "baseball_mlb")
-    URL = f"https://api.the-odds-api.com/v4/sports/{api_sport}/odds"
-    
-    params = {'apiKey': API_KEY, 'regions': 'us', 'markets': 'h2h', 'oddsFormat': 'american', 'bookmakers': 'draftkings,fanduel,betmgm,caesars'}
+    sport_upper = sport.upper()
+    current_time = time.time()
     raw_data = []
-    
-    try:
-        response = requests.get(URL, params=params, timeout=4)
-        if response.status_code == 200:
-            raw_data = response.json()
-    except Exception:
-        pass
+
+    # 1. Check Server-Side Cache First
+    if API_CACHE.get(sport_upper) and API_CACHE[sport_upper]["data"] is not None and (current_time - API_CACHE[sport_upper]["last_updated"]) < CACHE_EXPIRATION_SECONDS:
+        raw_data = API_CACHE[sport_upper]["data"]
+    else:
+        # Cache expired or empty -> Fetch fresh data from The Odds API
+        sport_keys = {
+            "MLB": "baseball_mlb",
+            "NFL": "americanfootball_nfl",
+            "MLS": "soccer_usa_mls"
+        }
+        api_sport = sport_keys.get(sport_upper, "baseball_mlb")
+        URL = f"https://api.the-odds-api.com/v4/sports/{api_sport}/odds"
+        params = {'apiKey': API_KEY, 'regions': 'us', 'markets': 'h2h', 'oddsFormat': 'american', 'bookmakers': 'draftkings,fanduel,betmgm,caesars'}
         
-    # 2. Dynamic fallback mock data if the API fails or is out of requests
-    # (We also inject a mock commence_time so the date displays beautifully in Demo Mode)
+        try:
+            response = requests.get(URL, params=params, timeout=4)
+            if response.status_code == 200:
+                raw_data = response.json()
+                # Save data to cache
+                if isinstance(raw_data, list) and len(raw_data) > 0:
+                    API_CACHE[sport_upper]["data"] = raw_data
+                    API_CACHE[sport_upper]["last_updated"] = current_time
+        except Exception:
+            pass
+        
+    # 2. Fallback Demo Mock Data (if API fails or returns no events)
     mock_future_date = (datetime.utcnow() + timedelta(days=1)).isoformat() + "Z"
 
     if not raw_data or not isinstance(raw_data, list) or "detail" in str(raw_data):
-        if sport.upper() == "NFL":
+        if sport_upper == "NFL":
             raw_data = [{"id": "mock_nfl_1", "commence_time": mock_future_date, "home_team": "Kansas City Chiefs", "away_team": "Baltimore Ravens", "bookmakers": [{"key": "draftkings", "markets": [{"key": "h2h", "outcomes": [{"name": "Kansas City Chiefs", "price": -150}, {"name": "Baltimore Ravens", "price": +130}]}]}]}]
-        elif sport.upper() == "MLS":
+        elif sport_upper == "MLS":
             raw_data = [{"id": "mock_mls_1", "commence_time": mock_future_date, "home_team": "LA Galaxy", "away_team": "Inter Miami", "bookmakers": [{"key": "draftkings", "markets": [{"key": "h2h", "outcomes": [{"name": "LA Galaxy", "price": +150}, {"name": "Inter Miami", "price": +140}, {"name": "Draw", "price": +210}]}]}]}]
         else:
             raw_data = [{"id": "mock_mlb_1", "commence_time": mock_future_date, "home_team": "Boston Red Sox", "away_team": "New York Yankees", "bookmakers": [{"key": "draftkings", "markets": [{"key": "h2h", "outcomes": [{"name": "Boston Red Sox", "price": -120}, {"name": "New York Yankees", "price": +100}]}]}]}]
@@ -275,7 +284,6 @@ def get_clean_bets(tier: str = Query("free"), sport: str = Query("MLB")):
         home_team = game.get('home_team')
         away_team = game.get('away_team')
         
-        # Initialize variables, adding Draw for MLS
         dk_home, dk_away, dk_draw = "N/A", "N/A", "N/A"
         best_home_price, best_home_book = -9999, "N/A"
         best_away_price, best_away_book = -9999, "N/A"
@@ -314,19 +322,17 @@ def get_clean_bets(tier: str = Query("free"), sport: str = Query("MLB")):
         best_pick = home_team if (home_edge > away_edge and home_edge > 2.0) else (away_team if (away_edge > home_edge and away_edge > 2.0) else "N/A")
         calculated_edge_val = home_edge if best_pick == home_team else (away_edge if best_pick == away_team else 0.0)
         
-        # 3. Generate dynamic player props based on the selected sport
         player_props = {}
-        if sport.upper() == "NFL":
+        if sport_upper == "NFL":
             player_props = {"title": "Player Passing Yards", "bets": [f"{away_team} QB Over 245.5 (-110)", f"{home_team} QB Over 260.5 (-110)"]}
-        elif sport.upper() == "MLS":
+        elif sport_upper == "MLS":
             player_props = {"title": "Shots on Target", "bets": [f"{away_team} Striker Over 1.5 (-130)", f"{home_team} Striker Over 0.5 (+110)"]}
         else:
             player_props = {"title": "Player Home Runs", "bets": [f"{away_team} Slugger Over 0.5 (+250)", f"{home_team} Slugger Over 0.5 (+310)"]}
 
-        # 4. Construct the final dictionary
         game_dict = {
             "matchup": f"{away_team} @ {home_team}",
-            "date": game.get("commence_time", "TBA"), # 👈 CATCHES DATE FROM API
+            "date": game.get("commence_time", "TBA"),
             "baseline_odds": {"home": dk_home, "away": dk_away},
             "line_shopping": {
                 "home": {"price": best_home_price, "bookmaker": best_home_book}, 
@@ -340,12 +346,10 @@ def get_clean_bets(tier: str = Query("free"), sport: str = Query("MLB")):
             }
         }
 
-        # 5. Add draw odds if it's MLS
-        if sport.upper() == "MLS" and dk_draw != "N/A":
+        if sport_upper == "MLS" and dk_draw != "N/A":
             game_dict["baseline_odds"]["draw"] = dk_draw
             game_dict["line_shopping"]["draw"] = {"price": best_draw_price, "bookmaker": best_draw_book}
 
-        # 6. Mask premium data if user is on the free tier
         if tier == "free":
             game_dict["premium_analytics"] = None
 
@@ -353,6 +357,7 @@ def get_clean_bets(tier: str = Query("free"), sport: str = Query("MLB")):
         
     return {"data": clean_games_list}
 
+# --- USER BET LOGGING ENDPOINTS ---
 @app.get("/bets/{user_id}")
 def get_user_bets(user_id: int):
     conn = psycopg2.connect(DB_URL)
@@ -362,14 +367,13 @@ def get_user_bets(user_id: int):
     cursor.close()
     conn.close()
     
-    # Map the new date column (r[2]) to the output dictionary
     return [{"id": r[0], "matchup": r[1], "date": r[2], "pick": r[3], "odds": r[4], "risk": r[5], "status": r[6], "netProfit": r[7]} for r in rows]
 
 @app.post("/bets/log")
 def log_user_bet(data: dict = Body(...)):
     user_id = data.get("user_id")
     matchup = data.get("matchup")
-    date = data.get("date", "TBA") # Catch the date from the frontend
+    date = data.get("date", "TBA")
     pick = data.get("pick")
     odds = data.get("odds")
     bet_id = str(uuid.uuid4())[:8]
@@ -410,14 +414,12 @@ def delete_user_bet(bet_id: str):
         
     return {"success": True}
 
-# --- MISSING SPORTSBOOK SYNC ENDPOINT ADDED HERE ---
+# --- SPORTSBOOK SYNC ENDPOINT ---
 @app.post("/sportsbooks/sync")
 def sync_sportsbooks(data: dict = Body(...)):
     user_id = data.get("user_id")
     sportsbook = data.get("sportsbook")
     
-    # You can expand this later to actually hit SharpSports/Ozone APIs.
-    # For now, it immediately validates the frontend request!
     if not user_id or not sportsbook:
         raise HTTPException(status_code=400, detail="Missing user or bookmaker data.")
         
