@@ -235,6 +235,11 @@ def upgrade_user_tier(data: dict = Body(...)):
     conn.close()
     return {"success": True, "tier": "premium"}
 
+# --- UPTIMEROBOT KEEP-ALIVE PING ---
+@app.head("/")
+def ping_head():
+    return {"status": "ok"}
+
 # --- LIVE SLATE DATA PROCESSOR (WITH CACHING) ---
 @app.get("/")
 def get_clean_bets(tier: str = Query("free"), sport: str = Query("MLB")):
