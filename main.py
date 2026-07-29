@@ -72,13 +72,17 @@ init_db()
 # --- ODDS API & CACHE CONFIGURATION ---
 API_KEY = '1954c37a0303d89d6f84accf5a8c6861'
 
-# Server-side cache dictionary to protect API request limits
+# Main Feed Cache (6 Hours)
 API_CACHE = {
     "MLB": {"data": None, "last_updated": 0},
     "NFL": {"data": None, "last_updated": 0},
     "MLS": {"data": None, "last_updated": 0}
 }
-CACHE_EXPIRATION_SECONDS = 21600  # 6 Hours (60 * 60 * 6)
+CACHE_EXPIRATION_SECONDS = 21600
+
+# EV Scanner Cache (45 Minutes = 2700 seconds) - Protects 500 call/mo limit
+EV_SCANNER_CACHE = {"timestamp": 0, "data": {}}
+EV_CACHE_TTL = 2700
 
 def american_to_implied(odds: int) -> float:
     if odds > 0: return 100 / (odds + 100)
@@ -240,18 +244,16 @@ def upgrade_user_tier(data: dict = Body(...)):
 def ping_head():
     return {"status": "ok"}
 
-# --- LIVE SLATE DATA PROCESSOR (WITH CACHING) ---
+# --- LIVE SLATE DATA PROCESSOR (MAIN FEED) ---
 @app.get("/")
 def get_clean_bets(tier: str = Query("free"), sport: str = Query("MLB")):
     sport_upper = sport.upper()
     current_time = time.time()
     raw_data = []
 
-    # 1. Check Server-Side Cache First
     if API_CACHE.get(sport_upper) and API_CACHE[sport_upper]["data"] is not None and (current_time - API_CACHE[sport_upper]["last_updated"]) < CACHE_EXPIRATION_SECONDS:
         raw_data = API_CACHE[sport_upper]["data"]
     else:
-        # Cache expired or empty -> Fetch fresh data from The Odds API
         sport_keys = {
             "MLB": "baseball_mlb",
             "NFL": "americanfootball_nfl",
@@ -265,14 +267,12 @@ def get_clean_bets(tier: str = Query("free"), sport: str = Query("MLB")):
             response = requests.get(URL, params=params, timeout=4)
             if response.status_code == 200:
                 raw_data = response.json()
-                # Save data to cache
                 if isinstance(raw_data, list) and len(raw_data) > 0:
                     API_CACHE[sport_upper]["data"] = raw_data
                     API_CACHE[sport_upper]["last_updated"] = current_time
         except Exception:
             pass
         
-    # 2. Fallback Demo Mock Data (if API fails or returns no events)
     mock_future_date = (datetime.utcnow() + timedelta(days=1)).isoformat() + "Z"
 
     if not raw_data or not isinstance(raw_data, list) or "detail" in str(raw_data):
@@ -361,6 +361,53 @@ def get_clean_bets(tier: str = Query("free"), sport: str = Query("MLB")):
         clean_games_list.append(game_dict)
         
     return {"data": clean_games_list}
+
+
+# --- NEW: EV SCANNER MULTI-BOOK ENDPOINT ---
+@app.get("/live-odds")
+def get_live_odds(sport: str = Query("baseball_mlb")):
+    """Fetches real-time market lines across major US sportsbooks + Pinnacle for EV mapping."""
+    current_time = time.time()
+
+    # 1. Return cached response if within the 45-minute TTL window
+    if sport in EV_SCANNER_CACHE["data"]:
+        cached_entry = EV_SCANNER_CACHE["data"][sport]
+        if current_time - cached_entry["timestamp"] < EV_CACHE_TTL:
+            return {
+                "success": True,
+                "cached": True,
+                "ttl_remaining": int(EV_CACHE_TTL - (current_time - cached_entry["timestamp"])),
+                "data": cached_entry["payload"],
+            }
+
+    # 2. Call The Odds API across multiple major books
+    url = f"https://api.the-odds-api.com/v4/sports/{sport}/odds/"
+    params = {
+        "apiKey": API_KEY,  # Uses your global API key
+        "regions": "us,eu", # EU region needed to access Pinnacle
+        "markets": "h2h",
+        "oddsFormat": "american",
+        "bookmakers": "draftkings,fanduel,betmgm,caesars,pinnacle,bovada",
+    }
+
+    try:
+        response = requests.get(url, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            # Update cache store
+            EV_SCANNER_CACHE["data"][sport] = {
+                "timestamp": current_time,
+                "payload": data,
+            }
+            return {"success": True, "cached": False, "data": data}
+        else:
+            return {
+                "success": False,
+                "error": f"API Error {response.status_code}: {response.text}",
+            }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 
 # --- USER BET LOGGING ENDPOINTS ---
 @app.get("/bets/{user_id}")
